@@ -3,3 +3,4 @@ samples/
 __pycache__/
 checkpoints/
 *.sh
+*.csv
