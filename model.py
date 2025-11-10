@@ -23,13 +23,14 @@ class SinusoidalPositionEmbeddings(nn.Module):
 # Improved Residual Block
 # -----------------------------
 class ResidualBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, time_emb_dim, dropout=0.1):
+    def __init__(self, in_ch, out_ch, time_emb_dim, dropout=0.1, use_checkpoint=False):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.bnorm1 = nn.GroupNorm(8, out_ch)  # GroupNorm is more stable than BatchNorm
+        self.bnorm1 = nn.GroupNorm(8, out_ch)
         self.bnorm2 = nn.GroupNorm(8, out_ch)
-        self.relu = nn.SiLU()  # SiLU works better for diffusion models
+        self.relu = nn.SiLU()
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_emb_dim, out_ch * 2)
@@ -39,7 +40,7 @@ class ResidualBlock(nn.Module):
         # Residual connection
         self.residual_conv = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x, t):
+    def _forward(self, x, t):
         h = x
         h = self.relu(self.bnorm1(self.conv1(h)))
         
@@ -53,19 +54,31 @@ class ResidualBlock(nn.Module):
         h = self.dropout(h)
         
         return h + self.residual_conv(x)
+    
+    def forward(self, x, t):
+        if self.use_checkpoint and self.training:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, t, use_reentrant=False)
+        return self._forward(x, t)
 
 # -----------------------------
-# Attention Block (optional but recommended)
+# Memory-Efficient Attention Block
 # -----------------------------
 class AttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=8):
+    """
+    Memory-efficient attention using:
+    1. PyTorch's scaled_dot_product_attention (Flash Attention when available)
+    2. Gradient checkpointing option
+    3. Chunked fallback for older PyTorch versions
+    """
+    def __init__(self, channels, num_heads=8, use_checkpoint=False):
         super().__init__()
         self.num_heads = num_heads
+        self.use_checkpoint = use_checkpoint
         self.norm = nn.GroupNorm(8, channels)
         self.qkv = nn.Conv2d(channels, channels * 3, 1)
         self.proj = nn.Conv2d(channels, channels, 1)
         
-    def forward(self, x):
+    def _attention(self, x):
         b, c, h, w = x.shape
         x_norm = self.norm(x)
         qkv = self.qkv(x_norm)
@@ -76,26 +89,44 @@ class AttentionBlock(nn.Module):
         k = k.view(b, self.num_heads, c // self.num_heads, h * w).transpose(2, 3)
         v = v.view(b, self.num_heads, c // self.num_heads, h * w).transpose(2, 3)
         
-        # Scaled dot-product attention
-        scale = (c // self.num_heads) ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
+        # Memory-efficient attention using scaled_dot_product_attention (PyTorch 2.0+)
+        # This automatically uses Flash Attention when available
+        try:
+            out = F.scaled_dot_product_attention(q, k, v)
+        except (AttributeError, RuntimeError):
+            # Fallback: chunk-based attention to reduce memory
+            scale = (c // self.num_heads) ** -0.5
+            chunk_size = 512  # Process in chunks to avoid OOM
+            out_chunks = []
+            
+            for i in range(0, q.shape[2], chunk_size):
+                q_chunk = q[:, :, i:i+chunk_size]
+                attn = torch.matmul(q_chunk, k.transpose(-2, -1)) * scale
+                attn = F.softmax(attn, dim=-1)
+                out_chunk = torch.matmul(attn, v)
+                out_chunks.append(out_chunk)
+            
+            out = torch.cat(out_chunks, dim=2)
         
-        out = torch.matmul(attn, v)
         out = out.transpose(2, 3).reshape(b, c, h, w)
         out = self.proj(out)
         
         return out + x
+    
+    def forward(self, x):
+        if self.use_checkpoint and self.training:
+            return torch.utils.checkpoint.checkpoint(self._attention, x, use_reentrant=False)
+        return self._attention(x)
 
 # -----------------------------
-# Down/Up Blocks with proper structure
+# Down/Up Blocks with gradient checkpointing
 # -----------------------------
 class DownBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, time_emb_dim, use_attn=False):
+    def __init__(self, in_ch, out_ch, time_emb_dim, use_attn=False, use_checkpoint=False):
         super().__init__()
-        self.res1 = ResidualBlock(in_ch, out_ch, time_emb_dim)
-        self.res2 = ResidualBlock(out_ch, out_ch, time_emb_dim)
-        self.attn = AttentionBlock(out_ch) if use_attn else nn.Identity()
+        self.res1 = ResidualBlock(in_ch, out_ch, time_emb_dim, use_checkpoint=use_checkpoint)
+        self.res2 = ResidualBlock(out_ch, out_ch, time_emb_dim, use_checkpoint=use_checkpoint)
+        self.attn = AttentionBlock(out_ch, use_checkpoint=use_checkpoint) if use_attn else nn.Identity()
         self.downsample = nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1)
         
     def forward(self, x, t):
@@ -107,12 +138,12 @@ class DownBlock(nn.Module):
         return x, skip
 
 class UpBlock(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch, time_emb_dim, use_attn=False):
+    def __init__(self, in_ch, skip_ch, out_ch, time_emb_dim, use_attn=False, use_checkpoint=False):
         super().__init__()
         self.upsample = nn.ConvTranspose2d(in_ch, in_ch, 4, stride=2, padding=1)
-        self.res1 = ResidualBlock(in_ch + skip_ch, out_ch, time_emb_dim)
-        self.res2 = ResidualBlock(out_ch, out_ch, time_emb_dim)
-        self.attn = AttentionBlock(out_ch) if use_attn else nn.Identity()
+        self.res1 = ResidualBlock(in_ch + skip_ch, out_ch, time_emb_dim, use_checkpoint=use_checkpoint)
+        self.res2 = ResidualBlock(out_ch, out_ch, time_emb_dim, use_checkpoint=use_checkpoint)
+        self.attn = AttentionBlock(out_ch, use_checkpoint=use_checkpoint) if use_attn else nn.Identity()
         
     def forward(self, x, skip, t):
         x = self.upsample(x)
@@ -123,10 +154,10 @@ class UpBlock(nn.Module):
         return x
 
 # -----------------------------
-# Fixed Conditional UNet
+# Memory-Optimized Conditional UNet
 # -----------------------------
 class ConditionalUNet(nn.Module):
-    def __init__(self, image_channels=3, time_dim=256, cond_dim=32, base_ch=64):
+    def __init__(self, image_channels=3, time_dim=256, cond_dim=32, base_ch=64, use_checkpoint=False):
         super().__init__()
         
         # Time embedding MLP
@@ -149,23 +180,23 @@ class ConditionalUNet(nn.Module):
         # Initial conv
         self.conv0 = nn.Conv2d(image_channels, base_ch, 3, padding=1)
         
-        # Down path with attention at lower resolutions
-        self.down1 = DownBlock(base_ch, base_ch * 2, time_dim * 4, use_attn=False)
-        self.down2 = DownBlock(base_ch * 2, base_ch * 4, time_dim * 4, use_attn=True)
-        self.down3 = DownBlock(base_ch * 4, base_ch * 8, time_dim * 4, use_attn=True)
+        # Down path - only use attention at lower resolutions to save memory
+        self.down1 = DownBlock(base_ch, base_ch * 2, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)
+        self.down2 = DownBlock(base_ch * 2, base_ch * 4, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)  # Disabled attn here
+        self.down3 = DownBlock(base_ch * 4, base_ch * 8, time_dim * 4, use_attn=True, use_checkpoint=use_checkpoint)   # Only at 32x32
         
         # Middle block
-        self.mid1 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4)
-        self.mid_attn = AttentionBlock(base_ch * 8)
-        self.mid2 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4)
+        self.mid1 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4, use_checkpoint=use_checkpoint)
+        self.mid_attn = AttentionBlock(base_ch * 8, use_checkpoint=use_checkpoint)
+        self.mid2 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4, use_checkpoint=use_checkpoint)
         
         # Up path
-        self.up3 = UpBlock(base_ch * 8, base_ch * 8, base_ch * 4, time_dim * 4, use_attn=True)
-        self.up2 = UpBlock(base_ch * 4, base_ch * 4, base_ch * 2, time_dim * 4, use_attn=True)
-        self.up1 = UpBlock(base_ch * 2, base_ch * 2, base_ch, time_dim * 4, use_attn=False)
+        self.up3 = UpBlock(base_ch * 8, base_ch * 8, base_ch * 4, time_dim * 4, use_attn=True, use_checkpoint=use_checkpoint)
+        self.up2 = UpBlock(base_ch * 4, base_ch * 4, base_ch * 2, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)
+        self.up1 = UpBlock(base_ch * 2, base_ch * 2, base_ch, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)
         
         # Output layers
-        self.final_res = ResidualBlock(base_ch, base_ch, time_dim * 4)
+        self.final_res = ResidualBlock(base_ch, base_ch, time_dim * 4, use_checkpoint=use_checkpoint)
         self.output = nn.Conv2d(base_ch, image_channels, 1)
         
     def forward(self, x, timestep, conditioning=None):
@@ -203,7 +234,7 @@ class ConditionalUNet(nn.Module):
 # Simple UNet (non-conditional)
 # -----------------------------
 class SimpleUNet(nn.Module):
-    def __init__(self, image_channels=3, time_dim=256, base_ch=64):
+    def __init__(self, image_channels=3, time_dim=256, base_ch=64, use_checkpoint=False):
         super().__init__()
         
         # Time embedding
@@ -217,19 +248,19 @@ class SimpleUNet(nn.Module):
         # Same architecture as ConditionalUNet but without conditioning
         self.conv0 = nn.Conv2d(image_channels, base_ch, 3, padding=1)
         
-        self.down1 = DownBlock(base_ch, base_ch * 2, time_dim * 4, use_attn=False)
-        self.down2 = DownBlock(base_ch * 2, base_ch * 4, time_dim * 4, use_attn=True)
-        self.down3 = DownBlock(base_ch * 4, base_ch * 8, time_dim * 4, use_attn=True)
+        self.down1 = DownBlock(base_ch, base_ch * 2, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)
+        self.down2 = DownBlock(base_ch * 2, base_ch * 4, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)
+        self.down3 = DownBlock(base_ch * 4, base_ch * 8, time_dim * 4, use_attn=True, use_checkpoint=use_checkpoint)
         
-        self.mid1 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4)
-        self.mid_attn = AttentionBlock(base_ch * 8)
-        self.mid2 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4)
+        self.mid1 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4, use_checkpoint=use_checkpoint)
+        self.mid_attn = AttentionBlock(base_ch * 8, use_checkpoint=use_checkpoint)
+        self.mid2 = ResidualBlock(base_ch * 8, base_ch * 8, time_dim * 4, use_checkpoint=use_checkpoint)
         
-        self.up3 = UpBlock(base_ch * 8, base_ch * 8, base_ch * 4, time_dim * 4, use_attn=True)
-        self.up2 = UpBlock(base_ch * 4, base_ch * 4, base_ch * 2, time_dim * 4, use_attn=True)
-        self.up1 = UpBlock(base_ch * 2, base_ch * 2, base_ch, time_dim * 4, use_attn=False)
+        self.up3 = UpBlock(base_ch * 8, base_ch * 8, base_ch * 4, time_dim * 4, use_attn=True, use_checkpoint=use_checkpoint)
+        self.up2 = UpBlock(base_ch * 4, base_ch * 4, base_ch * 2, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)
+        self.up1 = UpBlock(base_ch * 2, base_ch * 2, base_ch, time_dim * 4, use_attn=False, use_checkpoint=use_checkpoint)
         
-        self.final_res = ResidualBlock(base_ch, base_ch, time_dim * 4)
+        self.final_res = ResidualBlock(base_ch, base_ch, time_dim * 4, use_checkpoint=use_checkpoint)
         self.output = nn.Conv2d(base_ch, image_channels, 1)
         
     def forward(self, x, timestep):
